@@ -124,7 +124,7 @@ echo "$UID_MAX" | grep -qE '^[0-9]+$' || die "--uid-max must be a non-negative i
 
 # Check that required tools are available
 command -v repquota >/dev/null 2>&1 || die "'repquota' not found. Install quota-tools: yum install quota"
-command -v getent   >/dev/null 2>&1 || die "'getent' not found. Install glibc-common."
+command -v getent >/dev/null 2>&1 || die "'getent' not found. Install glibc-common."
 
 # Resolve the device: accept both block device paths and mount points
 if [ -b "$DEVICE" ]; then
@@ -285,5 +285,5 @@ dump_quota_type() {
     esac
 } > "$OUTPUT"
 
-EXPORTED=$(grep -cE '^(user|group)	' "$OUTPUT" 2>/dev/null || echo 0)
+EXPORTED=$(grep -cE $'^(user|group)\t' "$OUTPUT" 2>/dev/null || echo 0)
 echo "Done. Exported $EXPORTED quota entries to $OUTPUT" >&2

@@ -147,7 +147,7 @@ FS_TYPE=$(awk -v mp="$MOUNT_POINT" '$2 == mp { print $3 }' /proc/mounts)
 MOUNT_OPTS=$(awk -v mp="$MOUNT_POINT" '$2 == mp { print $4 }' /proc/mounts)
 NEEDS_USR=0
 NEEDS_GRP=0
-while IFS=$'\t' read -r f1 rest; do
+while IFS=$'\t' read -r f1 _; do
     [[ "$f1" =~ ^# ]]               && continue
     [[ "$f1" == "TYPE" || "$f1" == "UID" ]] && continue
     [[ -z "$f1" ]]                  && continue

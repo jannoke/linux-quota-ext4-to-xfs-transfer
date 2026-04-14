@@ -6,7 +6,7 @@ Transfer disk quota settings from an EXT4 filesystem (CentOS 6) to an XFS filesy
 
 ## Overview
 
-When migrating data from an EXT4 partition to an XFS partition you need to preserve per-user disk quotas.  These two scripts automate that process:
+When migrating data from an EXT4 partition to an XFS partition you need to preserve per-user and per-group disk quotas.  These two scripts automate that process:
 
 | Script | Run on | Purpose |
 |--------|--------|---------|
@@ -22,24 +22,24 @@ The dump file is plain text and can be reviewed, edited, or transferred with `sc
 ### Source server (CentOS 6 / EXT4)
 
 - `quota` / `repquota` — usually in the `quota` package: `yum install quota`
-- EXT4 filesystem mounted with the `usrquota` option  
+- EXT4 filesystem mounted with the `usrquota` and/or `grpquota` option  
   Example `/etc/fstab` entry:
   ```
-  /dev/sda2  /home  ext4  defaults,usrquota  0 2
+  /dev/sda2  /home  ext4  defaults,usrquota,grpquota  0 2
   ```
 - Quotas initialised and turned on:
   ```bash
-  quotacheck -cum /home
+  quotacheck -cugm /home
   quotaon /home
   ```
 
 ### Target server (Rocky 9 / XFS)
 
 - `xfs_quota` — usually in the `xfsprogs` package: `dnf install xfsprogs`
-- XFS filesystem mounted with the `usrquota` option  
+- XFS filesystem mounted with the `usrquota` and/or `grpquota` option  
   Example `/etc/fstab` entry:
   ```
-  /dev/sdb1  /home  xfs  defaults,usrquota  0 2
+  /dev/sdb1  /home  xfs  defaults,usrquota,grpquota  0 2
   ```
 
 ---
@@ -88,13 +88,19 @@ Run **on the target server** (Rocky 9):
 ### `dump-ext4-quotas.sh`
 
 ```bash
-# Basic: dump all quotas from /home
+# Basic: dump all (user + group) quotas from /home
 ./dump-ext4-quotas.sh -d /home
+
+# Dump only user quotas
+./dump-ext4-quotas.sh -d /home -t user -o /tmp/home-user-quotas.txt
+
+# Dump only group quotas
+./dump-ext4-quotas.sh -d /home -t group -o /tmp/home-group-quotas.txt
 
 # Specify a block device instead of a mount point
 ./dump-ext4-quotas.sh -d /dev/sda2 -o /tmp/home-quotas.txt
 
-# Export only UIDs 2000–3000
+# Export only IDs 2000-3000 (applies to both UIDs and GIDs)
 ./dump-ext4-quotas.sh -d /home -u 2000 -U 3000 -o dept-quotas.txt
 
 # Show help
@@ -113,7 +119,7 @@ Run **on the target server** (Rocky 9):
 # Force overwrite all existing quotas without prompting
 ./apply-xfs-quotas.sh -d /home -i quotas-dump.txt --force
 
-# Apply only a subset of UIDs from the dump file
+# Apply only a subset of UIDs/GIDs from the dump file
 ./apply-xfs-quotas.sh -d /home -i quotas-dump.txt -u 2000 -U 3000
 
 # Specify device by block device path
@@ -127,32 +133,37 @@ Run **on the target server** (Rocky 9):
 
 ## Dump File Format
 
-The dump file is a plain-text TSV (tab-separated values) file with comment header lines followed by one row per user.
+The dump file is a plain-text TSV (tab-separated values) file with comment header lines followed by one row per user or group.
 
 ```
-# ext4-quota-dump v1.0
+# ext4-quota-dump v1.1
 # source: /dev/sda2
 # mountpoint: /home
 # date: 2026-04-14
-# type: user
 # uid-min: 1000
 # uid-max: 65534
-UID	BLOCK_SOFT	BLOCK_HARD	INODE_SOFT	INODE_HARD
-1000	1048576	2097152	10000	20000
-1001	524288	1048576	5000	10000
+TYPE	ID	BLOCK_SOFT	BLOCK_HARD	INODE_SOFT	INODE_HARD
+user	1000	1048576	2097152	10000	20000
+user	1001	524288	1048576	5000	10000
+group	2000	524288	1048576	5000	10000
 ```
 
 | Column | Description |
 |--------|-------------|
-| `UID` | Numeric user ID |
+| `TYPE` | `user` or `group` |
+| `ID` | Numeric user ID (UID) or group ID (GID) |
 | `BLOCK_SOFT` | Soft block limit in **KB** |
 | `BLOCK_HARD` | Hard block limit in **KB** |
 | `INODE_SOFT` | Soft inode (file count) limit |
 | `INODE_HARD` | Hard inode (file count) limit |
 
-Only users that have at least one non-zero limit are included.
+Only entries that have at least one non-zero limit are included.
 
-You can edit the file manually before applying it to the target — for example to adjust limits or remove specific users.
+Named entries (usernames / groupnames) in `repquota` output are automatically resolved to numeric IDs with `getent`.  Entries that cannot be resolved (e.g. orphaned/deleted accounts) are silently skipped.
+
+You can edit the file manually before applying it to the target — for example to adjust limits or remove specific users or groups.
+
+**Backward compatibility:** `apply-xfs-quotas.sh` also accepts v1.0 dump files (5-column format with `UID` as the first column) and treats them as user quotas.
 
 ---
 
@@ -172,18 +183,18 @@ You can edit the file manually before applying it to the target — for example 
 
 ### `repquota` reports "No filesystems with quota detected"
 
-- Ensure the EXT4 filesystem is mounted with `usrquota` in `/etc/fstab`.
+- Ensure the EXT4 filesystem is mounted with `usrquota` and/or `grpquota` in `/etc/fstab`.
 - Run `quotaon -av` to enable quotas, then re-run the dump script.
 
 ### `xfs_quota: cannot set limits: Operation not permitted`
 
 - Ensure you are running `apply-xfs-quotas.sh` as **root**.
-- Verify that the XFS filesystem is mounted with `usrquota`.  
-  Check with: `grep usrquota /proc/mounts`
+- Verify that the XFS filesystem is mounted with the appropriate quota option.  
+  Check with: `grep -E 'usrquota|grpquota' /proc/mounts`
 
 ### Quotas appear to be zero after applying
 
-- Run `xfs_quota -x -c "report -u" /home` to verify that limits were set.
+- Run `xfs_quota -x -c "report -u" /home` (user) or `xfs_quota -x -c "report -g" /home` (group) to verify that limits were set.
 - Confirm the target mount point matches the device you specified with `-d`.
 
 ### `command not found: xfs_quota`

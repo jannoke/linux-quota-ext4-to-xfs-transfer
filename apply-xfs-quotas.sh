@@ -24,8 +24,8 @@ usage() {
     cat <<EOF
 Usage: $SCRIPT_NAME -d <device|mountpoint> -i <input-file> [OPTIONS]
 
-Apply user quotas from a dump file (created by dump-ext4-quotas.sh) to an
-XFS filesystem. Designed for Rocky 9 / XFS target systems.
+Apply user and/or group quotas from a dump file (created by dump-ext4-quotas.sh)
+to an XFS filesystem. Designed for Rocky 9 / XFS target systems.
 
 Required:
   -d, --device <path>    Target XFS device or mount point (e.g. /dev/sdb1 or /home)
@@ -35,8 +35,8 @@ Options:
   -n, --dry-run          Print the xfs_quota commands that would be run, but
                          do not execute them
   -f, --force            Overwrite existing quotas without prompting
-  -u, --uid-min <uid>    Minimum UID to apply (default: 1000)
-  -U, --uid-max <uid>    Maximum UID to apply (default: 65534)
+  -u, --uid-min <id>     Minimum UID/GID to apply (default: 1000)
+  -U, --uid-max <id>     Maximum UID/GID to apply (default: 65534)
   -h, --help             Show this help message and exit
 
 Examples:
@@ -49,7 +49,7 @@ Examples:
   # Force overwrite all existing quotas without prompting
   $SCRIPT_NAME -d /home -i quotas-dump.txt --force
 
-  # Apply only a subset of UIDs
+  # Apply only a subset of UIDs/GIDs
   $SCRIPT_NAME -d /home -i quotas-dump.txt -u 2000 -U 3000
 
   # Specify device by block device path with force flag
@@ -59,7 +59,8 @@ Notes:
   - EXT4 stores block limits in 1 KB units.  XFS uses the same 1 KB unit when
     limits are set via 'xfs_quota -x -c "limit ..."', so no conversion is needed.
   - Inode limits are dimensionless counts and require no conversion.
-  - User quotas must be enabled on the XFS mount (mount option: usrquota).
+  - User quotas require the 'usrquota' mount option on the XFS filesystem.
+  - Group quotas require the 'grpquota' mount option on the XFS filesystem.
 EOF
 }
 
@@ -141,25 +142,53 @@ FS_TYPE=$(awk -v mp="$MOUNT_POINT" '$2 == mp { print $3 }' /proc/mounts)
 [[ "$FS_TYPE" == "xfs" ]] || \
     die "Filesystem at $MOUNT_POINT is '$FS_TYPE', not xfs."
 
-# Check that user quotas are enabled
+# Determine which quota types are present in the input file, then check that
+# the corresponding mount options are enabled.
 MOUNT_OPTS=$(awk -v mp="$MOUNT_POINT" '$2 == mp { print $4 }' /proc/mounts)
-echo "$MOUNT_OPTS" | grep -q "usrquota\|uquota\|quota" || \
-    die "User quotas do not appear to be enabled on $MOUNT_POINT. Remount with 'usrquota' option."
+NEEDS_USR=0
+NEEDS_GRP=0
+while IFS=$'\t' read -r f1 rest; do
+    [[ "$f1" =~ ^# ]]               && continue
+    [[ "$f1" == "TYPE" || "$f1" == "UID" ]] && continue
+    [[ -z "$f1" ]]                  && continue
+    if [[ "$f1" == "group" ]]; then
+        NEEDS_GRP=1
+    else
+        # "user" or a bare numeric UID (v1.0 format)
+        NEEDS_USR=1
+    fi
+done < "$INPUT"
 
-# ---- Helper: get current XFS quota for a UID --------------------------------
+if (( NEEDS_USR )); then
+    echo "$MOUNT_OPTS" | grep -q "usrquota\|uquota\|quota" || \
+        die "User quotas are not enabled on $MOUNT_POINT. Remount with 'usrquota' option."
+fi
+if (( NEEDS_GRP )); then
+    echo "$MOUNT_OPTS" | grep -q "grpquota\|gquota" || \
+        die "Group quotas are not enabled on $MOUNT_POINT. Remount with 'grpquota' option."
+fi
 
-# Returns "block_soft block_hard inode_soft inode_hard" for the given UID,
-# or empty string if no quota is set (all limits are zero).
+# ---- Helper: get current XFS quota for a user or group ----------------------
+
+# get_current_xfs_quota TYPE ID
+# TYPE: "user" or "group"
+# Returns "block_soft block_hard inode_soft inode_hard" or empty string.
 get_current_xfs_quota() {
-    local uid="$1"
-    # xfs_quota -x -c "quota -u <uid>" <mountpoint>
+    local qtype="$1"
+    local id="$2"
+    local flag
+    if [[ "$qtype" == "group" ]]; then
+        flag="-g"
+    else
+        flag="-u"
+    fi
+    # xfs_quota -x -c "quota [-u|-g] <id>" <mountpoint>
     # Output example:
     #   Disk quotas for User 1000 (uid 1000):
     #   Filesystem              blocks      quota      limit  grace  files  quota  limit  grace
     #   /home                     1234    1048576    2097152             56  10000  20000
     local raw
-    raw=$(xfs_quota -x -c "quota -u $uid" "$MOUNT_POINT" 2>/dev/null || true)
-    # Extract the data line (third line, starts with the mount point)
+    raw=$(xfs_quota -x -c "quota $flag $id" "$MOUNT_POINT" 2>/dev/null || true)
     local data_line
     data_line=$(echo "$raw" | awk -v mp="$MOUNT_POINT" '$1 == mp { print }')
     if [[ -z "$data_line" ]]; then
@@ -168,17 +197,13 @@ get_current_xfs_quota() {
     fi
     # Fields: $1=filesystem $2=blocks_used $3=block_soft $4=block_hard ($5=grace optional)
     #         then files_used inode_soft inode_hard
-    # Use awk to parse reliably
     echo "$data_line" | awk '{
         b_soft = $3; b_hard = $4
-        # grace field is present when quota is exceeded; detect by checking
-        # whether field 5 looks like a time token (contains letters)
         if ($5 ~ /[a-zA-Z]/) {
             i_soft = $7; i_hard = $8
         } else {
             i_soft = $6; i_hard = $7
         }
-        # Only report non-zero limits
         if (b_soft+0 > 0 || b_hard+0 > 0 || i_soft+0 > 0 || i_hard+0 > 0) {
             printf "%s %s %s %s", b_soft, b_hard, i_soft, i_hard
         }
@@ -188,16 +213,22 @@ get_current_xfs_quota() {
 # ---- Apply a single quota ---------------------------------------------------
 
 apply_quota() {
-    local uid="$1"
-    local b_soft="$2"
-    local b_hard="$3"
-    local i_soft="$4"
-    local i_hard="$5"
+    local qtype="$1"
+    local id="$2"
+    local b_soft="$3"
+    local b_hard="$4"
+    local i_soft="$5"
+    local i_hard="$6"
+
+    # Use -u for user quotas, -g for group quotas.
+    local type_flag="-u"
+    if [[ "$qtype" == "group" ]]; then
+        type_flag="-g"
+    fi
 
     # xfs_quota limit command uses 1K-block units by default for bsoft/bhard,
     # which matches the KB values stored by dump-ext4-quotas.sh.
-    # Inode limits are plain counts.
-    local cmd="limit -u bsoft=${b_soft}k bhard=${b_hard}k isoft=${i_soft} ihard=${i_hard} ${uid}"
+    local cmd="limit ${type_flag} bsoft=${b_soft}k bhard=${b_hard}k isoft=${i_soft} ihard=${i_hard} ${id}"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         echo "[dry-run] xfs_quota -x -c \"$cmd\" \"$MOUNT_POINT\""
@@ -216,37 +247,50 @@ ERRORS=0
 echo "Applying quotas to $DEVICE ($MOUNT_POINT) ..." >&2
 [[ "$DRY_RUN" -eq 1 ]] && echo "(dry-run mode - no changes will be made)" >&2
 
-while IFS=$'\t' read -r uid b_soft b_hard i_soft i_hard; do
+while IFS=$'\t' read -r f1 f2 f3 f4 f5 f6; do
     # Skip comment and header lines
-    [[ "$uid" =~ ^# ]] && continue
-    [[ "$uid" == "UID" ]] && continue
-    [[ -z "$uid" ]] && continue
+    [[ "$f1" =~ ^# ]]                        && continue
+    [[ "$f1" == "TYPE" || "$f1" == "UID" ]]  && continue
+    [[ -z "$f1" ]]                           && continue
 
-    # Skip non-numeric UIDs (safety guard)
-    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    # Detect file format:
+    #   v1.1: TYPE  ID  BLOCK_SOFT  BLOCK_HARD  INODE_SOFT  INODE_HARD
+    #   v1.0: UID   BLOCK_SOFT  BLOCK_HARD  INODE_SOFT  INODE_HARD  (user quotas only)
+    if [[ "$f1" == "user" || "$f1" == "group" ]]; then
+        qtype="$f1"; id="$f2"; b_soft="$f3"; b_hard="$f4"; i_soft="$f5"; i_hard="$f6"
+    elif [[ "$f1" =~ ^[0-9]+$ ]]; then
+        # v1.0 format – treat as user quota
+        qtype="user"; id="$f1"; b_soft="$f2"; b_hard="$f3"; i_soft="$f4"; i_hard="$f5"
+    else
+        continue
+    fi
 
-    # Apply UID range filter
-    (( uid < UID_MIN || uid > UID_MAX )) && continue
+    # Ensure ID is numeric
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
 
-    # Check if a quota already exists for this UID
+    # Apply ID range filter (applies to both UIDs and GIDs)
+    (( id < UID_MIN || id > UID_MAX )) && continue
+
+    # Check if a quota already exists for this ID
     if [[ "$FORCE" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
-        existing=$(get_current_xfs_quota "$uid")
+        existing=$(get_current_xfs_quota "$qtype" "$id")
         if [[ -n "$existing" ]]; then
-            echo -n "Quota already exists for UID $uid ($existing). Overwrite? [y/N] "
+            echo -n "Quota already exists for ${qtype} ${id} ($existing). Overwrite? [y/N] "
             read -r answer </dev/tty
             if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-                echo "  Skipped UID $uid" >&2
+                echo "  Skipped ${qtype} ${id}" >&2
                 (( SKIPPED++ )) || true
                 continue
             fi
         fi
     fi
 
-    if apply_quota "$uid" "$b_soft" "$b_hard" "$i_soft" "$i_hard"; then
-        [[ "$DRY_RUN" -eq 0 ]] && echo "  Applied quota for UID $uid: bsoft=${b_soft}k bhard=${b_hard}k isoft=${i_soft} ihard=${i_hard}" >&2
+    if apply_quota "$qtype" "$id" "$b_soft" "$b_hard" "$i_soft" "$i_hard"; then
+        [[ "$DRY_RUN" -eq 0 ]] && \
+            echo "  Applied quota for ${qtype} ${id}: bsoft=${b_soft}k bhard=${b_hard}k isoft=${i_soft} ihard=${i_hard}" >&2
         (( APPLIED++ )) || true
     else
-        echo "  ERROR: Failed to apply quota for UID $uid" >&2
+        echo "  ERROR: Failed to apply quota for ${qtype} ${id}" >&2
         (( ERRORS++ )) || true
     fi
 done < "$INPUT"
